@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -10,6 +12,22 @@ using System.Threading.Tasks;
 
 namespace WowHeadFactionParser
 {
+    [DataContract]
+    public class Quest
+    {
+        [DataMember(Name = "category", IsRequired = true, Order = 0)]
+        public int Category;
+
+        [DataMember(Name = "category2", IsRequired = true, Order = 1)]
+        public int Category2;
+
+        [DataMember(Name = "id", IsRequired = true, Order = 2)]
+        public int ID;
+
+        [DataMember(Name = "name", IsRequired = true, Order = 3)]
+        public string Name;
+    }
+
     class Program
     {
         private static uint s_Total = 0;
@@ -19,50 +37,33 @@ namespace WowHeadFactionParser
         private static Thread s_Thread;
         private static StreamWriter s_Writer;
 
-        private static Regex s_Regex;
+        private static Regex s_Regex = new Regex(@"new Listview\({template: 'quest', id: 'objective-of', name: .+, data: (?<quests>.+)}\)");
+
+        public static HashSet<uint> Npcs = new HashSet<uint>();
+
+        public static Dictionary<uint, Quest[]> Quests = new Dictionary<uint, Quest[]>();
 
         static void Main(string[] args)
         {
-            if (args == null || args.Length != 2)
-            {
-                Console.WriteLine("Incorrect usage!\nExample: WowHeadFactionParser.exe min max");
-                return;
-            }
+            uint[] ids = new uint[] {62818};
 
-            uint start;
-            if (!uint.TryParse(args[0], out start))
-            {
-                Console.WriteLine("Enter valide start value");
-                return;
-            }
+            foreach (uint i in ids)
+                Npcs.Add(i);
 
-            uint end;
-            if (!uint.TryParse(args[1], out end))
-            {
-                Console.WriteLine("Enter valide end value");
-                return;
-            }
+            Console.WriteLine("Loaded {0} ids", Npcs.Count);
 
-            if (end < start)
-            {
-                Console.WriteLine("End value {0} should be higher that start value {1}", end, start);
-                return;
-            }
+            s_Total = (uint)Npcs.Count;
 
-            s_Total = end - start + 1;
-
-            s_Writer = new StreamWriter("out.txt");
+            s_Writer = new StreamWriter("out2.sql");
             s_Writer.AutoFlush = true;
-
-            s_Regex = new Regex("<div><span>(.*?)</span>[^}]*faction=(\\d+)");
 
             s_Thread = new Thread(x =>
             {
-                using (Worker worker = new Worker("npc={0}", 100000, 100))
+                using (Worker worker = new Worker("npc={0}", 100000, 3))
                 {
                     worker.OnGetResponse += OnGetResponseHandler;
                     worker.OnFinished += OnFinishedHandler;
-                    worker.Start(start, end);
+                    worker.Start();
                 }
             });
 
@@ -76,10 +77,28 @@ namespace WowHeadFactionParser
                 ++s_Failure;
             else
             {
-                MatchCollection matches = s_Regex.Matches(page);
-                if (matches.Count > 0)
+                var idx = page.IndexOf("bpet-calc-qualities");
+                Match match = s_Regex.Match(page);
+                if (match.Success)
                 {
-                    s_Writer.WriteLine("INSERT INTO `creature_onkill_reputation` (creature_id, RewOnKillRepFaction1, RewOnKillRepValue1, MaxStanding1, RewOnKillRepFaction2, RewOnKillRepValue2, MaxStanding2) VALUES ({0}, {1}, {2}, '0', '0', '0', '0');", id, matches[0].Groups[2].Value, matches[0].Groups[1].Value);
+                    string s = match.Groups[1].Value;
+                    using (MemoryStream stream = new MemoryStream(Encoding.UTF8.GetBytes(s)))
+                    {
+                        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(Quest[]));
+                        Quest[] result = (Quest[])serializer.ReadObject(stream);
+
+                        Quests.Add(id, result);
+                        //foreach (Quest q in result)
+                        {
+/*DELETE FROM `smart_scripts` WHERE `entryorguid` = 64330 AND `source_type` = 0;
+INSERT INTO `smart_scripts` VALUES
+(64330, 0, 0, 0, 64, 0, 100, 0, 0, 0, 0, 0, 0, 98, 14228, 14228, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 'On Hello - Send pet battle gossip'),
+(64330, 0, 1, 0, 62, 0, 100, 0, 14228, 0, 0, 0, 0, 139, 64330, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 'On Select - Start pet battle');
+
+UPDATE `creature_template` SET `AIName` = 'SmartAI' WHERE `entry` = 64330;*/
+                            //s_Writer.WriteLine("Npc {0}, Quest {1} - {2} ({3}, {4})", id, q.ID, q.Name, q.Category, q.Category2);
+                        }
+                    }
                 }
             }
 
@@ -88,6 +107,65 @@ namespace WowHeadFactionParser
 
         static void OnFinishedHandler()
         {
+            ///< Dump gossips
+
+            List<uint> npcTextIDs = new List<uint>();
+            List<uint> menuIDS = new List<uint>();
+            foreach (var kvp in Quests)
+            {
+                npcTextIDs.Add(kvp.Key * 10);
+                menuIDS.Add(kvp.Key * 10);
+            }
+
+            s_Writer.WriteLine("DELETE FROM `npc_text` WHERE `ID` IN ({0});", string.Join(", ", npcTextIDs.ToArray()));
+            s_Writer.WriteLine("INSERT INTO `npc_text` (`ID`, `Probability0`, `BroadcastTextID0`, `VerifiedBuild`) VALUES");
+            foreach (uint npcId in npcTextIDs)
+            {
+                s_Writer.WriteLine("({0}, 1, 62447, -1), -- Custom npc_text record for {1}", npcId, npcId / 10);
+            }
+
+            s_Writer.WriteLine("DELETE FROM `gossip_menu` WHERE `entry` IN ({0});", string.Join(", ", menuIDS.ToArray()));
+            s_Writer.WriteLine("INSERT INTO `gossip_menu` VALUES");
+            foreach (uint menuId in menuIDS)
+            {
+                s_Writer.WriteLine("({0}, {0}), -- Custom gossip_menu record for {1}", menuId, menuId / 10);
+            }
+
+            s_Writer.WriteLine("DELETE FROM `gossip_menu_option` WHERE `menu_id` IN ({0});", string.Join(", ", menuIDS.ToArray()));
+            s_Writer.WriteLine("INSERT INTO `gossip_menu_option` VALUES");
+            foreach (uint menuId in menuIDS)
+            {
+                s_Writer.WriteLine("({0}, 0, 0, '', 62660, 1, 3, 0, 0, 0, 0, '', 62661), -- Custom gossip_menu_option record for {1}", menuId, menuId / 10);
+            }
+
+            s_Writer.WriteLine("DELETE FROM `smart_scripts` WHERE `source_type` = 0 AND `entryorguid` IN ({0});", string.Join(", ", Quests.Keys.ToArray()));
+
+            s_Writer.WriteLine("INSERT INTO `smart_scripts` VALUES");
+            foreach (var kvp in Quests)
+            {
+                s_Writer.WriteLine("({0}, 0, 0, 0, 62, 0, 100, 0, {1}, 0, 0, 0, 0, 139, {0}, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 'On Select - Start pet battle'), -- TODO: sniff gossip, this is just a replacement", kvp.Key, kvp.Key * 10);
+            }
+
+            foreach (var kvp in Quests)
+            {
+                s_Writer.WriteLine("UPDATE `creature_template` SET `npcflag` = `npcflag` | 1, `gossip_menu_id` = {0}, `AIName` = 'SmartAI' WHERE `entry` = {1};", kvp.Key * 10, kvp.Key);
+            }
+
+            //foreach (var kvp in Quests)
+            s_Writer.WriteLine("DELETE FROM `conditions` WHERE `SourceTypeOrReferenceId` = 14 AND `SourceGroup` IN ({0});", string.Join(", ", npcTextIDs.ToArray()));
+            s_Writer.WriteLine("INSERT INTO `conditions` (`SourceTypeOrReferenceId`, `SourceGroup`, `SourceEntry`, `SourceId`, `ElseGroup`, `ConditionTypeOrReference`, `ConditionTarget`, `ConditionValue1`, `ConditionValue2`, `ConditionValue3`, `NegativeCondition`, `ErrorType`, `ErrorTextId`, `ScriptName`, `Comment`) VALUES");
+
+            foreach (var kvp in Quests)
+            {
+                int elseGroup = 0;
+                foreach (Quest q in kvp.Value)
+                {
+                    s_Writer.WriteLine("(15, {0}, {0}, 0, {1}, 47, 0, {2}, 8, 0, 0, 0, 0, '', 'Quest {2} - {3} - Show gossip only if quest is taken'),", kvp.Key * 10, elseGroup++, q.ID, q.Name);
+                }
+
+            }
+                //s_Writer.WriteLine("Npc {0}, Quest {1} - {2} ({3}, {4})", id, q.ID, q.Name, q.Category, q.Category2);
+
             s_Thread.Abort();
             s_Writer.Flush();
             s_Writer.Close();
@@ -122,7 +200,7 @@ namespace WowHeadFactionParser
         public Worker(string relative, int timeout, int connections)
         {
             m_relative = relative;
-            m_address = new Uri("http://wowhead.com/");
+            m_address = new Uri("http://en.wowhead.com/");
             m_badIds = new Queue<uint>();
 
             ServicePointManager.DefaultConnectionLimit = connections * 10;
@@ -143,17 +221,19 @@ namespace WowHeadFactionParser
             return true;
         }
 
-        public void Start(uint start, uint end)
+        public void Start()
         {
             m_timeStart = DateTime.Now;
 
-            for (uint entry = start; entry <= end; ++entry)
+            foreach (uint entry in Program.Npcs)
             {
                 if (!Process(entry))
                     break;
+
+                Thread.Sleep(250);
             }
 
-            while (m_semaphore.CurrentCount != 100)
+            while (m_semaphore.CurrentCount != 3)
             {
                 Thread.Sleep(1);
             }
@@ -168,7 +248,7 @@ namespace WowHeadFactionParser
                     break;
             }
 
-            while (m_semaphore.CurrentCount != 100)
+            while (m_semaphore.CurrentCount != 3)
             {
                 Thread.Sleep(1);
             }
